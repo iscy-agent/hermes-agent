@@ -78,7 +78,10 @@ _CAPABILITY_ENDPOINTS = (
     ("session_fork", ("POST", "/api/sessions/{session_id}/fork")),
     ("session_chat", ("POST", "/api/sessions/{session_id}/chat")),
     ("session_chat_stream", ("POST", "/api/sessions/{session_id}/chat/stream")),
-    ("session_model_lock", ("POST", "/api/sessions/{session_id}/model")))
+    ("session_model_lock", ("POST", "/api/sessions/{session_id}/model")),
+    ("file_upload", ("POST", "/v1/files")),
+    ("file_download", ("GET", "/v1/files/{id}/content")),
+    ("file_list", ("GET", "/v1/files")))
 
 
 def _approval_event_choices(*, smart_denied: bool, allow_session: bool, allow_permanent: bool) -> list[str]:
@@ -436,12 +439,35 @@ def _normalize_image_part(part: dict[str, Any]) -> dict[str, Any]:
     return image_part
 
 
-def _normalize_multimodal_content(content: Any) -> Any:
+def _normalize_file_part(part: dict[str, Any], resolve_file: Any) -> dict[str, Any]:
+    """Resolve an uploaded-file reference (Responses ``input_file`` / Chat ``file``) into a
+    text reference to the materialized path the agent's file tools read. ``resolve_file``
+    raises ``ValueError("file_not_found:...")`` for an unknown, expired or out-of-scope id."""
+    file_id = part.get("file_id")
+    if not (isinstance(file_id, str) and file_id.strip()):
+        file_ref = part.get("file")
+        file_id = file_ref.get("file_id") if isinstance(file_ref, dict) else None
+    if not (isinstance(file_id, str) and file_id.strip()):
+        raise ValueError("file_not_found:File parts must include a file_id.")
+    ref = resolve_file(file_id.strip())
+    path = str(ref.get("path") or "")
+    if not path:
+        raise ValueError("file_not_found:File resolution failed.")
+    filename = ref.get("filename") or path.rsplit("/", 1)[-1]
+    return {"type": "text", "text": (
+        f"Attached file: {path} ({filename}, {ref.get('content_type', '')}, "
+        f"{ref.get('size_bytes', 0)} bytes)")}
+
+
+def _normalize_multimodal_content(content: Any, *, resolve_file: Any = None) -> Any:
     """Validate multimodal content: a plain string when text-only, else canonical ``text`` /
     ``image_url`` parts (native OpenAI vision shape; Anthropic conversion happens downstream).
 
+    File parts (``file`` / ``input_file``) resolve through ``resolve_file`` (a
+    ``file_id`` -> materialized-path dict callable); without one they stay unsupported.
     Raises ``ValueError("<code>:<message>")`` with codes ``unsupported_content_type`` (file
-    parts, non-image data URLs, unknown types), ``invalid_image_url``, ``invalid_content_part``.
+    parts without a resolver, non-image data URLs, unknown types), ``file_not_found``,
+    ``invalid_image_url``, ``invalid_content_part``.
     """
     if content is None:
         return ""
@@ -466,9 +492,11 @@ def _normalize_multimodal_content(content: Any) -> Any:
         elif part_type in _IMAGE_PART_TYPES:
             normalized_parts.append(_normalize_image_part(part))
         elif part_type in _FILE_PART_TYPES:
-            raise ValueError(
-                "unsupported_content_type:Inline image inputs are supported, "
-                "but uploaded files and document inputs are not supported on this endpoint.")
+            if resolve_file is None:
+                raise ValueError(
+                    "unsupported_content_type:Inline image inputs are supported, "
+                    "but uploaded files and document inputs are not supported on this endpoint.")
+            normalized_parts.append(_normalize_file_part(part, resolve_file))
         else:
             raise ValueError(
                 f"unsupported_content_type:Unsupported content part type {raw_type!r}. "
@@ -483,14 +511,14 @@ def _normalize_multimodal_content(content: Any) -> Any:
 
 
 def _content_has_visible_payload(content: Any) -> bool:
-    """True when content has any text or image attachment.  Used to reject empty turns."""
+    """True when content has any text, image or file attachment.  Used to reject empty turns."""
     if isinstance(content, str):
         return bool(content.strip())
     if isinstance(content, list):
         for part in content:
             if isinstance(part, dict):
                 ptype = str(part.get("type") or "").strip().lower()
-                if ptype in _IMAGE_PART_TYPES or (
+                if ptype in _FILE_PART_TYPES or ptype in _IMAGE_PART_TYPES or (
                         ptype in _TEXT_PART_TYPES and str(part.get("text") or "").strip()):
                     return True
     return False
@@ -505,79 +533,15 @@ def _multimodal_validation_error(exc: ValueError, *, param: str) -> web.Response
     return _error_response(message, 400, code=code, param=param)
 
 
-def _reap_disconnected_agent_processes(
-    agent: Any, *, source: str = "api_server_sse_disconnect") -> None:
-    """Reap background processes an abandoned API-server turn created (these turns bypass
-    ``TurnRunner``). Daemon-thread fire-and-forget; epoch-gated so a stale reaper never kills
-    a newer run's process on a shared task_id.
-
-    Mirrors the gateway-turn cleanup in ``gateway/run.py`` (#76115) for this API-server surface, which runs
-    its own agent lifecycle via ``_run_agent`` and never passes through ``TurnRunner`` — so it needs its own
-    trigger for the same baseline-diff reap.
-    """
-    process_task_id = getattr(agent, "_gateway_turn_process_task_id", "")
-    process_baseline = getattr(agent, "_gateway_turn_process_baseline", None)
-    if not process_task_id or process_baseline is None:
-        return
-    epoch = getattr(agent, "_gateway_turn_process_epoch", None)
-    is_still_current: Optional[Any] = None
-    if epoch is not None:
-        def _epoch_still_current(_task_id=process_task_id, _epoch=epoch):
-            # Skip only when a NEWER run claimed this task_id. A missing entry means
-            # our own clear pruned it — no newer claimant, so the reap must proceed.
-            with _TURN_PROCESS_EPOCH_LOCK:
-                current = _TURN_PROCESS_EPOCHS.get(_task_id)
-            return current is None or current == _epoch
-        is_still_current = _epoch_still_current
-    from gateway.run import _reap_gateway_turn_processes
-    threading.Thread(
-        target=copy_context().run, args=(_reap_gateway_turn_processes, process_task_id, process_baseline),
-        kwargs={"source": source, "is_still_current": is_still_current},
-        name=f"api-turn-reaper-{process_task_id[:12]}", daemon=True).start()
-
-
-# Per-task-id run epochs for the reap gate: monotonic counter (never reused),
-# pruned on clear while still current, so the dict is bounded to in-flight runs.
-_TURN_PROCESS_EPOCHS: dict[str, int] = {}
-_TURN_PROCESS_EPOCH_LOCK = threading.Lock()
-_TURN_PROCESS_EPOCH_COUNTER = itertools.count(1)
-
-
-def _publish_turn_process_ownership(agent: Any, task_id: str) -> None:
-    """Snapshot the process baseline and claim the task_id's epoch — the single place every
-    API-server agent lifecycle records turn ownership (marker names cannot drift)."""
-    from tools.process_registry import process_registry
-    with _TURN_PROCESS_EPOCH_LOCK:
-        epoch = next(_TURN_PROCESS_EPOCH_COUNTER)
-        _TURN_PROCESS_EPOCHS[task_id] = epoch
-    agent._gateway_turn_process_task_id = task_id
-    agent._gateway_turn_process_baseline = process_registry.snapshot_running_ids(task_id)
-    agent._gateway_turn_process_epoch = epoch
-
-
-def _clear_turn_process_ownership(agent: Any) -> None:
-    """Clear turn ownership as soon as the turn ends: a later disconnect/cancel must not reap
-    background work the turn deliberately left running (same guard as gateway/run.py)."""
-    task_id = getattr(agent, "_gateway_turn_process_task_id", "")
-    epoch = getattr(agent, "_gateway_turn_process_epoch", None)
-    if task_id and epoch is not None:
-        with _TURN_PROCESS_EPOCH_LOCK:
-            # Prune only when this run is still the current claimant; a
-            # newer concurrent run owns the entry otherwise.
-            if _TURN_PROCESS_EPOCHS.get(task_id) == epoch:
-                del _TURN_PROCESS_EPOCHS[task_id]
-    agent._gateway_turn_process_task_id = ""
-    agent._gateway_turn_process_baseline = frozenset()
-    agent._gateway_turn_process_epoch = None
-
-
-def _session_chat_user_message(body: dict[str, Any], *, param: str = "message") -> tuple[Any, Optional[web.Response]]:
+def _session_chat_user_message(
+        body: dict[str, Any], *, param: str = "message", resolve_file: Any = None
+) -> tuple[Any, Optional[web.Response]]:
     """Parse and normalize session chat ``message`` / ``input`` like chat completions."""
     user_message = body.get("message") or body.get("input")
     if not _content_has_visible_payload(user_message):
         return None, _error_response("Missing 'message' field", 400, code="missing_message")
     try:
-        return _normalize_multimodal_content(user_message), None
+        return _normalize_multimodal_content(user_message, resolve_file=resolve_file), None
     except ValueError as exc:
         return None, _multimodal_validation_error(exc, param=param)
 
@@ -617,6 +581,7 @@ async def _abandon_agent_task(
         with suppress(Exception):
             # The abandoning client/server is the issuer, not the user (#112647).
             request_hard_interrupt(agent, reason, tool_reason=reason.lower())
+        from gateway.platforms.api_server_turn_process import _reap_disconnected_agent_processes
         _reap_disconnected_agent_processes(agent, source=reap_source)
     if not agent_task.done():
         agent_task.cancel()
@@ -1033,7 +998,11 @@ def _run_route_delegate(name: str):
     return _handler
 
 
-class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+# After _require_auth (the mixin's auth guard late-imports it at class-definition time).
+from gateway.platforms.api_server_chat_files import ChatFileExchangeMixin
+
+
+class APIServerAdapter(OpenAICompatRoutesMixin, ChatFileExchangeMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
     # Stateless request/response (``send()`` is a stub): async-delivery tools must not promise
@@ -1086,6 +1055,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._response_store_home = str(get_hermes_home())
         self._response_stores: dict[str, ResponseStore] = {}
         self._response_store_lock = threading.Lock()
+        self._file_stores: dict[str, Any] = {}  # per-profile-home chat FileStore cache
+        self._file_store_lock = threading.Lock()
         _api_runs._initialize_run_state(self, store_factory=RunIdempotencyStore)
         self._session_db: Optional[Any] = None  # explicit override (tests/manual wiring)
         self._session_dbs: dict[str, Any] = {}  # per-profile-home SessionDB cache
@@ -1588,6 +1559,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
+            # Chat file exchange: gated by the API server being enabled + a valid bearer
+            # key like the other /v1/* routes (NOT by browser extension control).
+            ("POST", "/v1/files", self._handle_file_upload),
+            ("GET", "/v1/files", self._handle_file_list),
+            ("GET", "/v1/files/{file_id}/content", self._handle_file_download),
             # Platform event ingress: authenticated by the target adapter's own verifier,
             # NOT API_SERVER_KEY (external platforms hold no API server key).
             ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
@@ -2384,6 +2360,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "The API server creates a server-side Hermes AIAgent; "
                     "tools execute on the API-server host unless a future "
                     "explicit split-runtime mode is enabled.")},
+            "file_exchange": {
+                "upload": {"method": "POST", "path": "/v1/files"},
+                "download": {"method": "GET", "path": "/v1/files/{id}/content"},
+                "list": {"method": "GET", "path": "/v1/files"},
+                "max_bytes": self._file_store().max_bytes,
+                "ttl_seconds": self._file_store().ttl_seconds},
             "features": features,
             "endpoints": {
                 name: {"method": entry[0], "path": entry[1]}
@@ -2834,7 +2816,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return None, err
-        user_message, err = _session_chat_user_message(body)
+        user_message, err = _session_chat_user_message(body, resolve_file=self._resolve_chat_file)
         if err is not None:
             return None, err
         try:
@@ -3758,6 +3740,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # /v1/runs runs its own agent lifecycle (no TurnRunner, no _run_agent) — record turn
                     # process ownership so stop/cancel can reap only the background processes this run
                     # created (#76115).
+                    from gateway.platforms.api_server_turn_process import _publish_turn_process_ownership
                     _publish_turn_process_ownership(agent, effective_task_id)
                     # Registering here, once, covers every _run_agent() caller — the same reason the
                     # _ProviderAuthResolutionError handler below lives here rather than in each route. Only
@@ -3821,6 +3804,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     if active_run_id:
                         self._active_run_agents.pop(active_run_id, None)
                     if agent is not None:
+                        from gateway.platforms.api_server_turn_process import _clear_turn_process_ownership
                         _clear_turn_process_ownership(agent)
                         self._shutdown_interruptible_agents.pop(id(agent), None)
                         self._memory_sessions.checkin(agent)

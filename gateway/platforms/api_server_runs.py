@@ -926,7 +926,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             register_gateway_notify(run.approval_session_key, approval_notify)
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.
-            _api_server._publish_turn_process_ownership(agent, effective_task_id)
+            from gateway.platforms.api_server_turn_process import _publish_turn_process_ownership
+            _publish_turn_process_ownership(agent, effective_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
             r = agent.run_conversation(
@@ -934,7 +935,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 task_id=effective_task_id, **author_kwargs)
         finally:
             # Clear ownership now so a later stop can't reap work this run left running.
-            _api_server._clear_turn_process_ownership(agent)
+            from gateway.platforms.api_server_turn_process import _clear_turn_process_ownership
+            _clear_turn_process_ownership(agent)
             self._memory_sessions.checkin(agent)
             # Declared-conversation binding, same precedence gate as _run_agent.
             if run.declared_selected:
@@ -1474,7 +1476,8 @@ async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Re
             _api_server.request_hard_interrupt(agent, "Stop requested via API")
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
         # run on the same session_id keeps its own); no-op if the run already finished.
-        _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")
+        from gateway.platforms.api_server_turn_process import _reap_disconnected_agent_processes
+        _reap_disconnected_agent_processes(agent, source="api_server_run_stop")
     return web.json_response({"run_id": run_id, "status": "stopping"})
 
 

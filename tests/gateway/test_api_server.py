@@ -558,7 +558,7 @@ class TestDisconnectedAgentReap:
     ownership was ever recorded on the agent."""
 
     def test_reaps_baseline_diff_for_owned_turn(self, monkeypatch):
-        from gateway.platforms.api_server import _reap_disconnected_agent_processes
+        from gateway.platforms.api_server_turn_process import _reap_disconnected_agent_processes
         from tools.process_registry import process_registry
 
         calls = []
@@ -585,7 +585,7 @@ class TestDisconnectedAgentReap:
         ]
 
     def test_noop_when_agent_has_no_ownership_markers(self, monkeypatch):
-        from gateway.platforms.api_server import _reap_disconnected_agent_processes
+        from gateway.platforms.api_server_turn_process import _reap_disconnected_agent_processes
         from tools.process_registry import process_registry
 
         calls = []
@@ -608,7 +608,7 @@ class TestDisconnectedAgentReap:
         """#76188 follow-up: concurrent API runs can share a client-provided
         session_id (same task_id). A disconnecting run whose epoch has been
         superseded must NOT kill the newer run's processes."""
-        from gateway.platforms.api_server import (
+        from gateway.platforms.api_server_turn_process import (
             _clear_turn_process_ownership,
             _publish_turn_process_ownership,
             _reap_disconnected_agent_processes,
@@ -647,7 +647,7 @@ class TestDisconnectedAgentReap:
         """A missing epoch entry (the abandoned run's own finally already
         cleared it) means no newer claimant — the reap must proceed using a
         pre-captured marker snapshot, or the leak survives."""
-        from gateway.platforms.api_server import (
+        from gateway.platforms.api_server_turn_process import (
             _clear_turn_process_ownership,
             _publish_turn_process_ownership,
             _reap_disconnected_agent_processes,
@@ -682,7 +682,7 @@ class TestDisconnectedAgentReap:
         assert calls == [True]
 
     def test_publish_and_clear_ownership_roundtrip(self, monkeypatch):
-        from gateway.platforms.api_server import (
+        from gateway.platforms.api_server_turn_process import (
             _TURN_PROCESS_EPOCHS,
             _clear_turn_process_ownership,
             _publish_turn_process_ownership,
@@ -713,7 +713,7 @@ class TestDisconnectedAgentReap:
     async def test_stop_run_reaps_owned_processes(self, adapter, monkeypatch):
         """POST /v1/runs/{id}/stop abandons the run — it must reap the
         background processes that run created (#76115 sibling surface)."""
-        from gateway.platforms.api_server import _publish_turn_process_ownership
+        from gateway.platforms.api_server_turn_process import _publish_turn_process_ownership
         from tools.process_registry import process_registry
 
         calls = []

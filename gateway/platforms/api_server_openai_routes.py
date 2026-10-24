@@ -281,6 +281,7 @@ class _ResponsesStream:
         self.final_text_parts: list[str] = []
         self.pending_tool_calls: list[dict[str, Any]] = []  # open function_call items, in order
         self.emitted_items: list[dict[str, Any]] = []  # output items so far (terminal payload)
+        self.file_items: list[dict[str, Any]] = []  # deliverable ``file`` items (terminal payload tail)
         self.output_index = 0
         self.call_counter = 0  # call_id fallback when the agent supplies no tool_call_id
         self.sequence_number = 0
@@ -511,6 +512,19 @@ class _ResponsesStream:
         ``hermes.status`` custom event; not a Responses output item."""
         await self.response.write(self._api._sse_frame(payload, event="hermes.status"))
 
+    async def emit_file_items(self, items: list[dict[str, Any]]) -> None:
+        """Deliverable files the final text references, as completed ``file`` output items
+        (mirrors the function_call added/done pair); the terminal payload lists them too."""
+        if not items:
+            return
+        await self.close_reasoning_item()
+        for item in items:
+            full = dict(item, id=self._item_id('file'), status="completed")
+            self.file_items.append(full)
+            idx = self._output_index(full['id'])
+            for event in ("response.output_item.added", "response.output_item.done"):
+                await self.write_event(event, {"type": event, "output_index": idx, "item": full})
+
     # queue tag -> (method name, payload adapter)
     _TAG_HANDLERS = {
         "__tool_started__": ("emit_tool_started", lambda p: p),
@@ -634,6 +648,7 @@ class _ResponsesStream:
             start = self.adapter._response_messages_turn_start_index(self.conversation_history, self.user_message, result)
             output = self.adapter._extract_output_items(result, start_index=start, response_id=self.response_id)
             output = self.response_store.order_output(self.durable_key[0], output)
+        output = output + self.file_items
         env = self.terminal_envelope(status, output,
             error=self._api._redact_api_error_text(result.get('error') or 'The admitted turn failed.')
             if status == 'failed' else None)
@@ -669,11 +684,12 @@ class _ResponsesStream:
         await self.write_event("response.failed", {"type": "response.failed", "response": env})
 
 
-def _parse_chat_messages(messages: list[Any]) -> tuple:
+def _parse_chat_messages(messages: list[Any], resolve_file: Any = None) -> tuple:
     """Chat ``messages`` -> ``(system_prompt, conversation_messages, error_response_or_None)``.
 
     System messages -> ephemeral system prompt layered ON TOP of core, flattened to text
-    (Anthropic rejects images there, OpenAI text models ignore them)."""
+    (Anthropic rejects images there, OpenAI text models ignore them). ``resolve_file``
+    resolves ``file`` content parts to materialized paths (None keeps them unsupported)."""
     from gateway.platforms.api_server import (
         _multimodal_validation_error, _normalize_chat_content, _normalize_multimodal_content)
     system_prompt = None
@@ -686,14 +702,14 @@ def _parse_chat_messages(messages: list[Any]) -> tuple:
             system_prompt = content if system_prompt is None else system_prompt + "\n" + content
         elif role in {"user", "assistant"}:
             try:
-                content = _normalize_multimodal_content(raw_content)
+                content = _normalize_multimodal_content(raw_content, resolve_file=resolve_file)
             except ValueError as exc:
                 return None, None, _multimodal_validation_error(exc, param=f"messages[{idx}].content")
             conversation_messages.append({"role": role, "content": content})
     return system_prompt, conversation_messages, None
 
 
-def _parse_responses_input(raw_input: Any) -> tuple:
+def _parse_responses_input(raw_input: Any, resolve_file: Any = None) -> tuple:
     """Responses ``input`` (string or item array) -> ``(input_messages, error_response_or_None)``."""
     from gateway.platforms.api_server import (
         _error_response, _multimodal_validation_error, _normalize_multimodal_content)
@@ -708,7 +724,7 @@ def _parse_responses_input(raw_input: Any) -> tuple:
                 continue
             elif isinstance(item, dict):
                 try:
-                    content = _normalize_multimodal_content(item.get("content", ""))
+                    content = _normalize_multimodal_content(item.get("content", ""), resolve_file=resolve_file)
                 except ValueError as exc:
                     return None, _multimodal_validation_error(exc, param=f"input[{idx}].content")
                 input_messages.append({"role": item.get("role", "user"), "content": content})
@@ -717,7 +733,7 @@ def _parse_responses_input(raw_input: Any) -> tuple:
     return input_messages, None
 
 
-def _parse_conversation_history(raw_history: Any) -> tuple:
+def _parse_conversation_history(raw_history: Any, resolve_file: Any = None) -> tuple:
     """Explicit Responses ``conversation_history`` -> ``(history, error_response_or_None)``."""
     from gateway.platforms.api_server import (
         _error_response, _multimodal_validation_error, _normalize_multimodal_content)
@@ -730,7 +746,7 @@ def _parse_conversation_history(raw_history: Any) -> tuple:
         if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
             return None, _error_response(f"conversation_history[{i}] must have 'role' and 'content' fields", 400)
         try:
-            entry_content = _normalize_multimodal_content(entry["content"])
+            entry_content = _normalize_multimodal_content(entry["content"], resolve_file=resolve_file)
         except ValueError as exc:
             return None, _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
         conversation_history.append({"role": str(entry["role"]), "content": entry_content})
@@ -822,6 +838,38 @@ class OpenAICompatRoutesMixin:
         agent_task.add_done_callback(_done)
         return agent_task, agent_ref
 
+    def _chat_completion_hermes_extras(
+            self, result: dict[str, Any], *, completed: bool, is_partial: bool, is_failed: bool,
+            err_msg: Any, finish_reason: str, budget_exhausted: bool, presentation_muted: bool,
+            response_headers: dict[str, str]) -> dict[str, Any]:
+        """The non-streaming ``hermes`` block: turn status extras + the deliverable ``files``
+        the final text references (side channel; the visible text is left untouched,
+        mirroring the streaming ``hermes.file`` events)."""
+        from gateway.platforms.api_server import _redact_api_error_text
+        extras: dict[str, Any] = {}
+        file_items = self._file_output_items(result.get("final_response") or "")
+        if file_items:
+            extras["files"] = file_items
+        if is_partial or is_failed or not completed:
+            extras.update(_hermes_extras(
+                completed, is_partial, is_failed, "" if presentation_muted else err_msg, finish_reason,
+                budget_exhausted=budget_exhausted))
+            response_headers["X-Hermes-Completed"] = "false"
+            response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
+            if err_msg and not presentation_muted:
+                response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
+        return extras
+
+    async def _emit_chat_file_events(self, response: web.StreamResponse, result: Any,
+                                    presentation_muted: bool) -> None:
+        """Deliverable files the final text references, on a dedicated ``hermes.file`` event
+        so strict OpenAI clients are not broken."""
+        from gateway.platforms.api_server import _sse_frame
+        if presentation_muted or not isinstance(result, dict):
+            return
+        for file_item in self._file_output_items(result.get("final_response") or ""):
+            await response.write(_sse_frame(file_item, event="hermes.file"))
+
     async def _handle_chat_completions(self, request: web.Request) -> web.Response:
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         from gateway.platforms.api_server import (
@@ -843,7 +891,8 @@ class OpenAICompatRoutesMixin:
             return _invalid_request("Missing or invalid 'messages' field")
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
-        system_prompt, conversation_messages, messages_err = _parse_chat_messages(messages)
+        system_prompt, conversation_messages, messages_err = _parse_chat_messages(
+            messages, resolve_file=self._resolve_chat_file)
         if messages_err is not None:
             return messages_err
         user_message: Any = (conversation_messages[-1].get("content", "") if conversation_messages else "")
@@ -1011,14 +1060,12 @@ class OpenAICompatRoutesMixin:
         reasoning_text = _turn_reasoning_text(history, user_message, result)
         if reasoning_text and not presentation_muted:
             response_data["choices"][0]["message"]["reasoning_content"] = reasoning_text
-        if is_partial or is_failed or not completed:
-            response_data["hermes"] = _hermes_extras(
-                completed, is_partial, is_failed, "" if presentation_muted else err_msg, finish_reason,
-                budget_exhausted=budget_exhausted)
-            response_headers["X-Hermes-Completed"] = "false"
-            response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
-            if err_msg and not presentation_muted:
-                response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
+        hermes_extras = self._chat_completion_hermes_extras(
+            result, completed=completed, is_partial=is_partial, is_failed=is_failed,
+            err_msg=err_msg, finish_reason=finish_reason, budget_exhausted=budget_exhausted,
+            presentation_muted=presentation_muted, response_headers=response_headers)
+        if hermes_extras:
+            response_data["hermes"] = hermes_extras
         return web.json_response(response_data, headers=response_headers)
 
     def _chat_request_id(self, request: web.Request) -> Optional[str]:
@@ -1184,6 +1231,7 @@ class OpenAICompatRoutesMixin:
                 tail, appended = _post_stream_transform(result)
                 if tail:
                     await response.write(_sse_frame(_chunk({"content": tail if appended else _transformed_notice() + tail})))
+            await self._emit_chat_file_events(response, result, presentation_muted)
             if finish_reason != "stop":
                 if err_msg and not presentation_muted:
                     finish_chunk["error"] = {
@@ -1238,7 +1286,14 @@ class OpenAICompatRoutesMixin:
                 await st.dispatch(item)
             await st.flush_batch()
             await st.collect_result(agent_task)
+            # The agent's final text (close_message_item overwrites final_response_text with
+            # the joined deltas, which may predate the final).
+            final_text = st.result.get("final_response", "") if isinstance(st.result, dict) else ""
             await st.close_message_item()
+            if not st.terminal_replay:
+                # Deliverable files the final text references (a terminal_replay observer
+                # already saw them on the original stream; its terminal envelope carries them).
+                await st.emit_file_items(self._file_output_items(final_text))
             if st.agent_error and not (durable_key and st.result):
                 await st.emit_failed()
             else:
@@ -1442,6 +1497,9 @@ class OpenAICompatRoutesMixin:
             "usage": _responses_usage_payload(usage)}
         if durable_key:
             response_data['output'] = self._current_response_store().order_output(durable_key[0], response_data['output'])
+        # Deliverable files the final text references (additive; the visible text is left
+        # untouched, mirroring the streaming ``file`` output items).
+        response_data["output"].extend(self._file_output_items(result.get("final_response") or ""))
         if response_data['status'] == 'failed':
             response_data['error'] = {'code': 'agent_error', 'message': _redact_api_error_text(
                 result.get('error') or 'The admitted turn failed.')}

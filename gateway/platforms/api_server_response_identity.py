@@ -6,7 +6,7 @@ Item IDs derive from response identity and occurrence; no additional transcript/
 import hashlib
 import json
 
-_PREFIXES = {'function_call': 'fc', 'function_call_output': 'fco', 'reasoning': 'rs', 'message': 'msg'}
+_PREFIXES = {'function_call': 'fc', 'function_call_output': 'fco', 'reasoning': 'rs', 'message': 'msg', 'file': 'file'}
 
 
 def durable_response_id(request_key):

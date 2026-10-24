@@ -153,12 +153,12 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
     previous = body.get('previous_response_id')
     if body.get('conversation'):
         previous = adapter._current_response_store().get_conversation(body['conversation'])
-    messages, error = _parse_responses_input(body['input'])
+    messages, error = _parse_responses_input(body['input'], resolve_file=adapter._resolve_chat_file)
     if error is not None:
         return None, error
     history = []
     if body.get('conversation_history'):
-        history, error = _parse_conversation_history(body['conversation_history'])
+        history, error = _parse_conversation_history(body['conversation_history'], resolve_file=adapter._resolve_chat_file)
         if error is not None:
             return None, error
     stored_session_id = chain_root = None
